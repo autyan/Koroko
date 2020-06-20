@@ -1,0 +1,498 @@
+import Layout from 'lib/components/layout'
+import {} from '@zeit-ui/react'
+
+export const meta = {
+  title: '深入ASP.NET Core源代码之 - HOST',
+  date: '2020-06-20T02:48:11.253Z',
+  description: '',
+  image: '',
+}
+
+> 测试代码运行环境：
+> 
+> OS:Ubuntu 18.04 64bit
+> 
+> .NET Core: 3.1.101
+> 
+> 源代码版本：release/3.1
+
+# 起点 - Program.cs
+---
+
+首先通过 .NET Core CLI 指令新建一个空的模板 ASP.NET Core 应用程序
+
+> dotenet new web -n SampleWeb
+
+指令会新建一个全新的 ASP.NET Core模板应用程序，文件结构如下：
+
+```
+SampleWeb
+|   appsettings.Development.json
+|   appsettings.json
+|---obj
+|   Program.cs
+|   Properties
+|   SampleWeb.csproj
+|   Startup.cs
+```
+
+Program.cs包含了配置及启动 ASP.NET Core 应用程序的全部代码，一共只有寥寥几行，非常简洁高效，我们今天的主角IWebHostBuilder、IWebHost就在其中。
+
+> ASP.NET CORE 3.0 将早期版本的WebHostBuilder替换成了全新的基于GenericHost的HostBuilder，可以为 ASP.NET Core 应用程序与非WEB应用程序更好的集成，共享更多基础代码。具体信息可前往[What's new in ASP.NET Core 3.0](https://docs.microsoft.com/en-us/aspnet/core/release-notes/aspnetcore-3.0?view=aspnetcore-3.1#generic-host)查看。
+
+```
+//...省略部分代码
+
+namespace SmapleWeb
+{
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            CreateHostBuilder(args).Build().Run();
+        }
+
+        public static IHostBuilder CreateHostBuilder(string[] args) =>
+            Host.CreateDefaultBuilder(args)
+                .ConfigureWebHostDefaults(webBuilder =>
+                {
+                    webBuilder.UseStartup<Startup>();
+                });
+    }
+}
+```
+
+Host.CreateDefaultBuilder()方法会创建一个默认的HostBuilder对象，配置Startup类作为HOST启动后的应用程序配置入口点。
+
+完成HostBuilder的创建及配置后，只需要按照顺序调用Build()方法**返回IHost对象**，及Run()方法**启动IHost**，应用程序就启动完成了。
+
+# 应用程序元数据的配置 - IHostBuilder及实现
+---
+
+`IHostBuilder` 接口：
+```
+namespace Microsoft.Extensions.Hosting
+{
+    public interface IHostBuilder
+    {
+        IDictionary<object, object> Properties { get; }
+
+        IHostBuilder ConfigureHostConfiguration(Action<IConfigurationBuilder> configureDelegate);
+
+        IHostBuilder ConfigureAppConfiguration(Action<HostBuilderContext, IConfigurationBuilder> configureDelegate);
+
+        IHostBuilder ConfigureServices(Action<HostBuilderContext, IServiceCollection> configureDelegate);
+
+        IHostBuilder UseServiceProviderFactory<TContainerBuilder>(IServiceProviderFactory<TContainerBuilder> factory);
+
+        IHostBuilder UseServiceProviderFactory<TContainerBuilder>(Func<HostBuilderContext, IServiceProviderFactory<TContainerBuilder>> factory);
+
+        IHostBuilder ConfigureContainer<TContainerBuilder>(Action<HostBuilderContext, TContainerBuilder> configureDelegate);
+
+        IHost Build();
+    }
+}
+
+```
+
+> IHostBuilder 定义在dotnet/extensions项目中（[GITHUB REPO](https://github.com/dotnet/extensions)）。
+> 项目名称为：Microsoft.Extensions.Hosting.Abstractions。
+> 名称空间Microsoft.Extensions.Hosting
+> [源代码](https://github.com/dotnet/extensions/blob/release/3.1/src/Hosting/Abstractions/src/IHostBuilder.cs)
+
+IHostBuilder一共定义了八个接口成员，下表展示了这些接口成员的主要用途：
+
+| 接口成员 | 成员类型 | 用途 |
+| ------- | ------- |-----|
+| Properties | 属性 | 用于自定义组件在创建IHost对象过程中共享数据 |
+| ConfigureHostConfiguration | 方法  | 用于配置IHostBuilder在创建IHost对象过程中需要使用到的各种配置信息，在本方法中会初始化Microsoft.Extensions.Hosting.IHostEnvironment对象|
+|ConfigureAppConfiguration|方法|用于配置应用程序初始化及运行过程中所需的配置项|
+|ConfigureServices|方法|注册应用程序所需的各种服务|
+|UseServiceProviderFactory（及重载）|方法|用于替换系统默认的IOC容器（Service Provider）|
+|ConfigureContainer|方法|用于配置IOC容器实例的细节|
+|Build|方法|生成IHost对象|
+
+在创建IHost对象的过程中，我们可以定制应用程序所需的各种基本配置，并通过这些接口成员注入到IHostBuilder对象中。
+
+## IHostBuilder的默认实现
+`IHostBuilder`的默认实现:`HostBuilder`
+> HostBuilder 定义在dotnet/extensions项目中（[GITHUB REPO](https://github.com/dotnet/extensions)）。
+> 项目名称为：Microsoft.Extensions.Hosting。
+> 名称空间Microsoft.Extensions.Hosting
+> [源代码](https://github.com/dotnet/extensions/blob/release/3.1/src/Hosting/Hosting/src/HostBuilder.cs)
+
+在HostBuilder的默认实现中，定义了一系列对应的``List<Action>``对象来存储用户注册到``ConfigureHostConfiguration``、``ConfigureAppConfiguration``、``ConfigureServices``等方法中的配置函数
+
+```
+private List<Action<IConfigurationBuilder>> _configureHostConfigActions = new List<Action<IConfigurationBuilder>>();
+private List<Action<HostBuilderContext, IConfigurationBuilder>> _configureAppConfigActions = new List<Action<HostBuilderContext, IConfigurationBuilder>>();
+private List<Action<HostBuilderContext, IServiceCollection>> _configureServicesActions = new List<Action<HostBuilderContext, IServiceCollection>>();
+```
+
+下面我们看一下Build方法的实现；
+```
+public IHost Build()
+{
+    if (_hostBuilt)
+    {
+        throw new InvalidOperationException("Build can only be called once.");
+    }
+    _hostBuilt = true;
+
+    BuildHostConfiguration();
+    CreateHostingEnvironment();
+    CreateHostBuilderContext();
+    BuildAppConfiguration();
+    CreateServiceProvider();
+
+    return _appServices.GetRequiredService<IHost>();
+}
+```
+Build方法的内容也很简单，只有一个基本检查和五个步骤。
+1、首先检查是否重复创建了IHost对象，每个IHostBuilder对象只能运行一次Build方法，否则抛出异常，确保我们不会重复创建IHost对象。
+2、第二步初始化创建IHost对象过程中需要使用到的基本配置信息。
+3、第三步初始化应用程序的`Microsoft.Extensions.Hosting.IHostEnvironment`对象，用来向应用程序提供程序运行环境信息（Development、Stage、Production等）。
+4、第四步初始化（根据第二部初始化的基本配置信息）创建IHost对象所需要的所有上下文对象。
+5、最后创建IOC容器，并将默认的IHost对象(`Microsoft.Extensions.Hosting.Internal.Host`)注入到IOC容易中，然后将IHost对象从IOC容器里取出并返回给方法的调用方。
+
+**至此，`IHostBuilder`就完成了它的全部使命。**
+
+# 应用程序宿主 - IHost及实现
+
+`IHost`接口
+
+```
+public interface IHost : IDisposable
+{
+    IServiceProvider Services { get; }
+
+    Task StartAsync(CancellationToken cancellationToken = default);
+
+    Task StopAsync(CancellationToken cancellationToken = default);
+}
+```
+> IHost 定义在dotnet/extensions项目中（[GITHUB REPO](https://github.com/dotnet/extensions)）。
+> 项目名称为：Microsoft.Extensions.Hosting.Abstractions。
+> 名称空间Microsoft.Extensions.Hosting
+> [源代码](https://github.com/dotnet/extensions/blob/release/3.1/src/Hosting/Abstractions/src/IHost.cs)
+
+
+相较于`IHostBuilder`接口，`IHost`接口的定义要简单的多，只有三个成员对象：
+
+| 接口成员 | 成员类型 | 用途 |
+| ------- | ------- |-----|
+| Services | 属性 | 用于获取注册在IOC容器中的服务 |
+| StartAsync | 方法  | 启动应用程序|
+|StopAsync|方法|停止应用程序|
+
+## IHost的默认实现
+
+`IHost`的默认实现:`Internal.Host`
+> HostBuilder 定义在dotnet/extensions项目中（[GITHUB REPO](https://github.com/dotnet/extensions)）。
+> 项目名称为：Microsoft.Extensions.Hosting。
+> 名称空间Microsoft.Extensions.Hosting.Internal
+> [源代码](https://github.com/dotnet/extensions/blob/release/3.1/src/Hosting/Hosting/src/Internal/Host.cs)
+
+`StartAsync`方法的实现：
+```
+public async Task StartAsync(CancellationToken cancellationToken = default)
+{
+    _logger.Starting();
+
+    using var combinedCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _applicationLifetime.ApplicationStopping);
+    var combinedCancellationToken = combinedCancellationTokenSource.Token;
+
+    await _hostLifetime.WaitForStartAsync(combinedCancellationToken);
+
+    combinedCancellationToken.ThrowIfCancellationRequested();
+    _hostedServices = Services.GetService<IEnumerable<IHostedService>>();
+
+    foreach (var hostedService in _hostedServices)
+    {
+        // Fire IHostedService.Start
+        await hostedService.StartAsync(combinedCancellationToken).ConfigureAwait(false);
+    }
+
+    // Fire IHostApplicationLifetime.Started
+    _applicationLifetime?.NotifyStarted();
+
+    _logger.Started();
+}
+```
+
+`StartAsync`方法将注册到HostBuilder上下文中的`IHostedService`对象按照注册时的先后顺序执行`IHostedService.StartAsync()`方法进行启动。
+将所有的`IHostedService`对象执行启动完毕后，通过应用程序生命周期管理对象`IApplicationLifetime`通知应用程序，启动就完成了。
+
+`StopAsync`方法的实现：
+
+```
+public async Task StopAsync(CancellationToken cancellationToken = default)
+{
+    _logger.Stopping();
+
+    using (var cts = new CancellationTokenSource(_options.ShutdownTimeout))
+    using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, cancellationToken))
+    {
+        var token = linkedCts.Token;
+        // Trigger IHostApplicationLifetime.ApplicationStopping
+        _applicationLifetime?.StopApplication();
+
+        IList<Exception> exceptions = new List<Exception>();
+        if (_hostedServices != null) // Started?
+        {
+            foreach (var hostedService in _hostedServices.Reverse())
+            {
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    await hostedService.StopAsync(token).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    exceptions.Add(ex);
+                }
+            }
+        }
+
+        token.ThrowIfCancellationRequested();
+        await _hostLifetime.StopAsync(token);
+
+        // Fire IHostApplicationLifetime.Stopped
+        _applicationLifetime?.NotifyStopped();
+
+        if (exceptions.Count > 0)
+        {
+            var ex = new AggregateException("One or more hosted services failed to stop.", exceptions);
+            _logger.StoppedWithException(ex);
+            throw ex;
+        }
+    }
+
+    _logger.Stopped();
+}
+```
+
+`StopAsync`方法与`StartAsync`方法基本类型，首先通过应用程序生命周期管理对象`IApplicationLifetime`通知应用程序即将开始停止服务，然后一次调用`IHostedService`对象停止服务的运行，最后通知应用程序已完成结束方法。
+
+# ASP.NET Core 的扩展方法
+
+从默认的`IHostBuilder`及默认的`IHost`对象源代码中我们可以发现，`IHostBuidler`及`IHost`对象仅仅提供了创建现代化的应用程序（基于依赖注入、控制反转等编程思想）的最基础支持，而仅靠默认的实现我们还无法构建一个现代WEB应用程序，因此ASP.NET Core应用程序框架在默认的`IHostBuilder`及`IHost`对象之上，提供了扩展方法，帮助我们构建一个基本的现代WEB应用程序。
+
+## 扩展方法 - CreateDefaultBuilder
+
+> CreateDefaultBuilder 定义在dotnet/extensions项目中（[GITHUB REPO](https://github.com/dotnet/extensions)）。
+> 项目名称为：Microsoft.Extensions.Hosting。
+> 名称空间Microsoft.Extensions.Hosting
+> [源代码](https://github.com/dotnet/extensions/blob/release/3.1/src/Hosting/Hosting/src/Host.cs)
+
+`CreateDefaultBuilder`方法：
+```
+public static IHostBuilder CreateDefaultBuilder(string[] args)
+{
+    var builder = new HostBuilder();
+
+    builder.UseContentRoot(Directory.GetCurrentDirectory());
+    builder.ConfigureHostConfiguration(config =>
+    {
+        config.AddEnvironmentVariables(prefix: "DOTNET_");
+        if (args != null)
+        {
+            config.AddCommandLine(args);
+        }
+    });
+
+    builder.ConfigureAppConfiguration((hostingContext, config) =>
+    {
+        var env = hostingContext.HostingEnvironment;
+
+        config.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+              .AddJsonFile($"appsettings.{env.EnvironmentName}.json", optional: true, reloadOnChange: true);
+
+        if (env.IsDevelopment() && !string.IsNullOrEmpty(env.ApplicationName))
+        {
+            var appAssembly = Assembly.Load(new AssemblyName(env.ApplicationName));
+            if (appAssembly != null)
+            {
+                config.AddUserSecrets(appAssembly, optional: true);
+            }
+        }
+
+        config.AddEnvironmentVariables();
+
+        if (args != null)
+        {
+            config.AddCommandLine(args);
+        }
+    })
+    .ConfigureLogging((hostingContext, logging) =>
+    {
+        var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+        // IMPORTANT: This needs to be added *before* configuration is loaded, this lets
+        // the defaults be overridden by the configuration.
+        if (isWindows)
+        {
+            // Default the EventLogLoggerProvider to warning or above
+            logging.AddFilter<EventLogLoggerProvider>(level => level >= LogLevel.Warning);
+        }
+
+        logging.AddConfiguration(hostingContext.Configuration.GetSection("Logging"));
+        logging.AddConsole();
+        logging.AddDebug();
+        logging.AddEventSourceLogger();
+
+        if (isWindows)
+        {
+            // Add the EventLogLoggerProvider on windows machines
+            logging.AddEventLog();
+        }
+    })
+    .UseDefaultServiceProvider((context, options) =>
+    {
+        var isDevelopment = context.HostingEnvironment.IsDevelopment();
+        options.ValidateScopes = isDevelopment;
+        options.ValidateOnBuild = isDevelopment;
+    });
+
+    return builder;
+}
+```
+
+从源代码中我们可以看到，`CreateDefaultBuilder`方法配置了默认的ContentRoot配置项，用于指示应用程序从哪里获取静态文件和WEB程序的根目录。加载了`DOTNET_`前缀的系统环境变量，并从`appsettings.json`和`appsettings.{env.EnvironmentName}.json`文件中加载应用程序配置信息。配置日志组件，并添加了日志系统的输出路径，而且针对Windows操作系统额外添加了日志的拦截器和WindowsEvent组件的日志输出路径。
+
+## 扩展方法 - ConfigureWebHostDefaults
+
+> CreateDefaultBuilder有一个较长的调用链，最终实际对ASP.NET Core应用程序进行配置的方法是`WebHost.ConfigureWebDefaults`方法 
+> `WebHost.ConfigureWebDefaults`方法定义在dotnet/aspnetcore项目中([GITHUB REPO](https://github.com/dotnet/aspnetcore)）。
+> 项目名称为：Microsoft.AspNetCore
+> 名称空间Microsoft.AspNetCore
+> [源代码](https://github.com/dotnet/aspnetcore/blob/6c31da5b1f59f6155ab397b6c962640e4d96f27b/src/DefaultBuilder/src/WebHost.cs)
+
+`CreateDefaultBuilder`方法：
+```
+    internal static void ConfigureWebDefaults(IWebHostBuilder builder)
+    {
+      builder.ConfigureAppConfiguration((Action<WebHostBuilderContext, IConfigurationBuilder>) ((ctx, cb) =>
+      {
+        if (!ctx.HostingEnvironment.IsDevelopment())
+          return;
+        StaticWebAssetsLoader.UseStaticWebAssets(ctx.HostingEnvironment, ctx.Configuration);
+      }));
+      builder.UseKestrel((Action<WebHostBuilderContext, KestrelServerOptions>) ((builderContext, options) => options.Configure((IConfiguration) builderContext.Configuration.GetSection("Kestrel")))).ConfigureServices((Action<WebHostBuilderContext, IServiceCollection>) ((hostingContext, services) =>
+      {
+        services.PostConfigure<HostFilteringOptions>((Action<HostFilteringOptions>) (options =>
+        {
+          if (options.AllowedHosts != null && options.AllowedHosts.Count != 0)
+            return;
+          string str = hostingContext.Configuration["AllowedHosts"];
+          string[] strArray1;
+          if (str == null)
+            strArray1 = (string[]) null;
+          else
+            strArray1 = str.Split(new char[1]{ ';' }, StringSplitOptions.RemoveEmptyEntries);
+          string[] strArray2 = strArray1;
+          HostFilteringOptions filteringOptions = options;
+          string[] strArray3;
+          if (strArray2 == null || strArray2.Length == 0)
+            strArray3 = new string[1]{ "*" };
+          else
+            strArray3 = strArray2;
+          filteringOptions.AllowedHosts = (IList<string>) strArray3;
+        }));
+        services.AddSingleton<IOptionsChangeTokenSource<HostFilteringOptions>>((IOptionsChangeTokenSource<HostFilteringOptions>) new ConfigurationChangeTokenSource<HostFilteringOptions>(hostingContext.Configuration));
+        services.AddTransient<IStartupFilter, HostFilteringStartupFilter>();
+        if (string.Equals("true", hostingContext.Configuration["ForwardedHeaders_Enabled"], StringComparison.OrdinalIgnoreCase))
+        {
+          services.Configure<ForwardedHeadersOptions>((Action<ForwardedHeadersOptions>) (options =>
+          {
+            options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+            options.KnownNetworks.Clear();
+            options.KnownProxies.Clear();
+          }));
+          services.AddTransient<IStartupFilter, ForwardedHeadersStartupFilter>();
+        }
+        services.AddRouting();
+      })).UseIIS().UseIISIntegration();
+    }
+```
+
+从源代码中我们可以看到，`ConfigureWebDefaults`方法配置了Web Server 组件`Kestrel`用来处理HTTP通信，加载了CORS基础配置，配置了ForwardedHeaders（用于支持代理服务如Nginx等），添加了基础的路由组件并配置了IIS的支持组件。
+于是ASP.NET Core应用程序此时已经可以支持HTTP通信，并且无需额外配置就可以运行在代理服务器之上。还可以根据请求的URI信息进行路由分配，查找对应的Controller类/Action方法。
+
+## 扩展方法 - UserStartup
+
+> `UserStartup`有一个较长的调用链，最终实际对ASP.NET Core应用程序进行配置的方法是`WebHostBuilderExtensions.UserStartup`方法 
+> `WebHostBuilderExtensions.UserStartup`方法定义在dotnet/aspnetcore项目中([GITHUB REPO](https://github.com/dotnet/aspnetcore)）。
+> 项目名称为：Microsoft.AspNetCore.Hosting
+> 名称空间Microsoft.AspNetCore.Hosting
+> [源代码](https://github.com/dotnet/aspnetcore/blob/1480b998660d2f77d0605376eefab6a83474ce07/src/Hosting/Hosting/src/WebHostBuilderExtensions.cs)
+
+`UserStartup` 方法
+
+```
+    public static IWebHostBuilder UseStartup(
+      this IWebHostBuilder hostBuilder,
+      Type startupType)
+    {
+      string name = startupType.GetTypeInfo().Assembly.GetName().Name;
+      hostBuilder.UseSetting(WebHostDefaults.ApplicationKey, name);
+      return hostBuilder is ISupportsStartup supportsStartup ? supportsStartup.UseStartup(startupType) : hostBuilder.ConfigureServices((Action<IServiceCollection>) (services =>
+      {
+        if (typeof (IStartup).GetTypeInfo().IsAssignableFrom(startupType.GetTypeInfo()))
+          ServiceCollectionServiceExtensions.AddSingleton(services, typeof (IStartup), startupType);
+        else
+          ServiceCollectionServiceExtensions.AddSingleton(services, typeof (IStartup), (Func<IServiceProvider, object>) (sp =>
+          {
+            IHostEnvironment requiredService = sp.GetRequiredService<IHostEnvironment>();
+            return (object) new ConventionBasedStartup(StartupLoader.LoadMethods(sp, startupType, requiredService.EnvironmentName));
+          }));
+      }));
+    }
+```
+
+`UserStartup`方法将会在应用程序中查找注册的`Startup`类，并执行`Startup`类的配置方法对ASP.NET Core应用程序执行最后的，用户层面的最终配置，在`Startup`类中，我们将详细的配置我们的ASP.NET Core应用程序已满足我们对业务支撑的需要。这也是绝大多数开发者首次接触到的ASP.NET Core应用程序配置的地点。
+值得注意的是，在`UserStartup`方法中，会首先查找声明了`IStartup`接口的`Startup`类（如果此处传入的`IWebHostBuiler`声明了`ISupportStartup`接口的话。）。因此除了将ASP.NET Core应用程序直接编译成可执行程序外，我们也可以将ASP.NET Core应用程序写在类库类型的项目中，由类库的使用者来帮助我们启动ASP.NET Core应用程序。
+
+# 终点 - Startup.cs
+
+`Startup`类：
+
+```
+namespace SmapleWeb
+{
+    public class Startup
+    {
+        // This method gets called by the runtime. Use this method to add services to the container.
+        // For more information on how to configure your application, visit https://go.microsoft.com/fwlink/?LinkID=398940
+        public void ConfigureServices(IServiceCollection services)
+        {
+        }
+
+        // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+        {
+            if (env.IsDevelopment())
+            {
+                app.UseDeveloperExceptionPage();
+            }
+
+            app.UseRouting();
+
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapGet("/", async context =>
+                {
+                    await context.Response.WriteAsync("Hello World!");
+                });
+            });
+        }
+    }
+}
+```
+
+空ASP.NET Core项目的Startup类非常简单，实现了一个空的`ConfigureServices`方法，在这个方法里，我们可以注入我们需要使用的各种服务类或基础组件类。
+并且实现了`Configure`方法，注册了基础路由组件和终结点组件，能够处理访问WEB ROOT的路径的请求，并返回Hello World!
+
+以上就是ASP.NET Core应用程序关于HOST类的全部源代码，我们可以看到ASP.NET Core应用程序的宿主类的实现并不复杂，并且除了支持ASP.NET Core应用程序之外，还可以支持我们方便的写出各种类型的服务程序，只需要我们根据实际需要实现一些基本类型即可。
+
+export default ({ children }) => <Layout meta={meta}>{children}</Layout>
